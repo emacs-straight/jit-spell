@@ -1,12 +1,12 @@
 ;;; jit-spell.el --- Just-in-time spell checking      -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2023  Augusto Stoffel
+;; Copyright (C) 2023  Free Software Foundation, Inc.
 
 ;; Author: Augusto Stoffel <arstoffel@gmail.com>
 ;; Keywords: tools, wp
 ;; URL: https://github.com/astoff/jit-spell
 ;; Package-Requires: ((emacs "27.1") (compat "29.1"))
-;; Version: 0
+;; Version: 0.1
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -23,13 +23,32 @@
 
 ;;; Commentary:
 
-;; TODO
+;; This package provides `jit-spell-mode', a local minor mode to
+;; highlight all misspelled words in a window, just like a word
+;; processor or web browser does.
+;;
+;; This behavior is different from Flyspell, which only checks words
+;; as the cursor moves over them.  Moreover, unlike Flyspell,
+;; jit-spell communicates with the spell-checking subprocess entirely
+;; asynchronously, which can lead to a noticeable performance
+;; improvement.
+;;
+;; To set up jit-spell, add your desired variation of the following to
+;; your init file:
+;;
+;;   (add-hook 'text-mode-hook 'jit-spell-mode)
+;;   (add-hook 'prog-mode-hook 'jit-spell-mode)
+;;   (with-eval-after-load 'jit-spell
+;;     (define-key jit-spell-mode-map (kbd "C-;") 'jit-spell-correct-word))
+;;
+;; jit-spell relies on the `ispell' library to pick a spell checking
+;; program and dictionaries.  Try `M-x customize-group ispell' to see
+;; a listing of all possible settings.
 
 ;;; Code:
 
 (require 'compat)
 (require 'ispell)
-(require 'seq)
 (eval-when-compile (require 'subr-x))
 
 (defgroup jit-spell nil
@@ -54,17 +73,18 @@
     font-latex-sedate-face
     message-header-name)
   "Faces jit-spell should ignore."
-  :type '(repeat symbol))
+  :type '(repeat face))
 
 (defcustom jit-spell-prog-mode-faces
   '(font-lock-comment-face
     font-lock-doc-face
     font-lock-string-face)
   "Faces jit-spell should check in modes derived from `prog-mode'."
-  :type '(repeat symbol))
+  :type '(repeat face))
 
 (defvar jit-spell-delayed-commands
   '(backward-delete-char-untabify
+    delete-backward-char
     self-insert-command)
   "List of commands with delayed spell checking.
 Wait for `jit-spell-current-word-delay' seconds before
@@ -456,15 +476,11 @@ again moves to the next misspelling."
              (not (memq this-command jit-spell-delayed-commands)))
     (jit-spell--unhide-overlay)))
 
-(defvar-keymap jit-spell-mode-map
-  :doc "Keymap for `jit-spell-mode'."
-  "C-;" #'jit-spell-correct-word
-  "C-:" #'jit-spell-accept-word)
+(defvar-keymap jit-spell-mode-map :doc "Keymap for `jit-spell-mode'.")
 
 ;;;###autoload
 (define-minor-mode jit-spell-mode
   "Just-in-time spell checking."
-  :keymap jit-spell-mode-map
   :lighter (" Spell"
             (:propertize
              (:eval
