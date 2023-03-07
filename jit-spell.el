@@ -47,9 +47,9 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'compat)
 (require 'ispell)
-(eval-when-compile (require 'subr-x))
 
 (defgroup jit-spell nil
   "Check spelling as you type."
@@ -82,18 +82,32 @@
   "Faces jit-spell should check in modes derived from `prog-mode'."
   :type '(repeat face))
 
-(defvar jit-spell-delayed-commands
-  '(backward-delete-char-untabify
-    delete-backward-char
-    self-insert-command)
-  "List of commands with delayed spell checking.
-Wait for `jit-spell-current-word-delay' seconds before
-highlighting a misspelling at point after one of these commands.")
+(defcustom jit-spell-use-apostrophe-hack 'auto
+  "Whether to work around Hunspell's issue parsing apostrophes.
 
-(defvar jit-spell-ignored-p #'jit-spell--default-ignored-p
+In some languages, Hunspell always considers the apostrophe
+character (a.k.a. straight quote) part of the word, which leads
+to false positives when it is used as a quotation mark."
+  :type '(choice (const :tag "Decide automatically" auto)
+                 (const :tag "Yes" t)
+                 (const :tag "No" nil)))
+
+(defvar jit-spell-delayed-commands nil)
+(make-obsolete-variable 'jit-spell-delayed-commands "Not necessary anymore" "0.2")
+
+(defvar jit-spell--ignored-p #'jit-spell--default-ignored-p
   "Predicate satisfied by words to ignore.
 It should be a function taking two arguments, the start and end
 positions of the word.")
+(make-obsolete-variable 'jit-spell-ignored-p 'jit-spell--ignored-p "0.2")
+
+(defvar jit-spell--filter-region #'jit-spell--filter-region
+  "Function to extract regions of interest from the buffer.
+It receives the start and end positions of a region as argument,
+and should return a list of cons cells representing subregions.
+
+This function is called inside a `save-excursion' form and can
+move the point with impunity.")
 
 (defvar jit-spell--process-pool nil
   "A collection of ispell processes for `jit-spell-mode'.")
@@ -158,7 +172,7 @@ character offset from START, and a list of corrections."
       (pcase-dolist (`(,word ,offset ,corrections) misspellings)
         (let* ((wstart (+ start offset -1))
                (wend (+ wstart (length word))))
-          (unless (funcall jit-spell-ignored-p wstart wend)
+          (unless (funcall jit-spell--ignored-p wstart wend)
             (jit-spell--make-overlay wstart wend corrections)))))))
 
 (defun jit-spell--overlay-at (pos)
@@ -206,11 +220,11 @@ It can also be bound to a mouse click to pop up the menu."
                             (vector corr (lambda () (interactive)
                                            (jit-spell--apply-correction ov corr)))))
       (easy-menu-add-item map nil `["Save to Dictionary"
-                                    (jit-spell-accept-word ,word 'dict)])
+                                    (jit-spell--accept-word ,word 'dict)])
       (easy-menu-add-item map nil `["Save to Buffer"
-                                    (jit-spell-accept-word ,word 'buffer)])
+                                    (jit-spell--accept-word ,word 'buffer)])
       (easy-menu-add-item map nil `["Accept for Session"
-                                    (jit-spell-accept-word ,word 'session)])
+                                    (jit-spell--accept-word ,word 'session)])
       (unless menu (popup-menu map)))
     menu))
 
@@ -234,16 +248,26 @@ It can also be bound to a mouse click to pop up the menu."
 ;;; Subprocess communication
 
 (defun jit-spell--process-parameters ()
-  "Return a list of parameters for this buffer's ispell process.
-Buffers where this produces `equal' results will share their
-ispell process."
+  "Return a list of parameters for this buffer's ispell process."
   (list ispell-program-name
         ispell-current-dictionary
         ispell-current-personal-dictionary
         ispell-extra-args))
 
 (defun jit-spell--get-process ()
-  "Get an ispell process for the current buffer."
+  "Get an ispell process for the current buffer.
+Buffers where `jit-spell--process-parameters' returns the `equal'
+results share their ispell process.
+
+The process plist includes the following properties:
+
+`jit-spell--current request': a list of the form
+    (BUFFER TICK START END)
+  where TICK is used to keep track of the timeliness of the response.
+  Note that the process receives a single request at a time.
+
+`jit-spell--requests': a FIFO queue with elements in the same
+  form as above."
   (let* ((params (jit-spell--process-parameters))
          (proc (plist-get jit-spell--process-pool params #'equal)))
     (if (process-live-p proc)
@@ -316,28 +340,17 @@ ispell process."
   (pcase-let ((`(,buffer _ ,start ,end) request))
     (with-current-buffer buffer
       (let ((text (buffer-substring-no-properties start end)))
-                                        ;TODO: allow custom
-                                        ;buffer-substring functions
-                                        ;e.g. to work around
-                                        ;hunspell's apostrophe issue.
-        ;; Redact control characters in text
-        (dotimes (i (length text))
-          (when (< (aref text i) ?\s)
-            (aset text i ?\s)))
         (process-send-string proc "^")
         (process-send-string proc text)
         (process-send-string proc "\n")))))
 
 (defun jit-spell--schedule-pending-checks (buffer)
   "Schedule a call to `jit-spell--check-pending-regions' in BUFFER."
-  (when (buffer-live-p buffer)
-    (when (bound-and-true-p jit-spell--debug)
-      (message "Scheduled recheck"))
-    (with-current-buffer buffer
-      (when (timerp jit-spell--recheck-timer)
-        (cancel-timer jit-spell--recheck-timer))
-      (setq jit-spell--recheck-timer
-            (run-with-idle-timer 0.1 nil #'jit-spell--check-pending-regions buffer)))))
+  (with-current-buffer buffer
+    (when (timerp jit-spell--recheck-timer)
+      (cancel-timer jit-spell--recheck-timer))
+    (setq jit-spell--recheck-timer
+          (run-with-idle-timer 0.1 nil #'jit-spell--check-pending-regions buffer))))
 
 (defun jit-spell--check-pending-regions (buffer)
   "Enqueue spell check requests for all pending regions of BUFFER."
@@ -356,54 +369,69 @@ ispell process."
                                  (pop (process-get proc 'jit-spell--requests)))))
           (jit-spell--send-request proc request))))))
 
+(defun jit-spell--filter-region (start end)
+  "Return a list of subregions without control characters between START and END."
+  (goto-char start)
+  (let (regions)
+    (while (re-search-forward (rx (+ print)) end t)
+      (push (cons (match-beginning 0) (match-end 0)) regions))
+    regions))
+
+(defun jit-spell--apostrophe-hack (regions)
+  "Refine REGIONS to work around Hunspell's apostrophe issue."
+  (mapcan
+   (pcase-lambda (`(,i . ,limit)) ;; Refine one region
+     (let (result)
+       (goto-char i)
+       (while (re-search-forward
+               (rx (or (seq (or bol (not alpha)) (group ?') alpha)
+                       (seq alpha (group ?') (or (not alpha) eol))))
+               limit t)
+         (backward-char)
+         (let ((j (or (match-end 1) (match-beginning 2))))
+           (push (cons i j) result)
+           (setq i j)))
+       (push (cons i limit) result)))
+   regions))
+
 (defun jit-spell--check-region (start end)
   "Enqueue a spell check request for region between START and END.
 This is intended to be a member of `jit-lock-functions'."
-  (save-excursion ;; Extend region to include whole words
+  (save-excursion
+    ;; Extend region to include whole words
     (goto-char start)
     (setq start (if (re-search-backward "\\s-" nil t) (match-end 0) (point-min)))
     (goto-char end)
-    (setq end (or (re-search-forward "\\s-" nil t) (point-max))))
-  (put-text-property start end 'jit-spell-pending t)
-  (let ((proc (jit-spell--get-process))
-        (request (list (current-buffer) (buffer-chars-modified-tick) start end)))
-    (if (process-get proc 'jit-spell--current-request)
-        (push request (process-get proc 'jit-spell--requests))
-      (jit-spell--send-request proc request)))
-  `(jit-lock-bounds ,start . ,end))
+    (setq end (or (re-search-forward "\\s-" nil t) (point-max)))
+    (let ((proc (jit-spell--get-process))
+          (buffer (current-buffer))
+          (tick (buffer-chars-modified-tick)))
+      (pcase-dolist (`(,i . ,j) (funcall jit-spell--filter-region start end))
+        (put-text-property i j 'jit-spell-pending t)
+        (let ((request (list buffer tick i j)))
+          (if (process-get proc 'jit-spell--current-request)
+              (push request (process-get proc 'jit-spell--requests))
+            (jit-spell--send-request proc request)))))
+    `(jit-lock-bounds ,start . ,end)))
 
 ;;; Interactive commands and major mode
 
-(defun jit-spell-accept-word (word where)
+(defun jit-spell--accept-word (word where)
   "Accept spelling of WORD.
 WHERE can be `dict' (save in personal dictionary), `buffer' (save
 as a local word at the end of the buffer), `session' (accept
 temporarily and in this buffer only), or `query' (ask for one of
 the above)."
-  (interactive
-   (list (completing-read
-          "Add word: "
-          (thread-last
-            (overlays-in (window-start) (window-end))
-            (seq-sort (lambda (o1 o2) (< (overlay-start o1)
-                                         (overlay-start o2))))
-            (seq-keep (lambda (ov)
-                        (when (eq (overlay-get ov 'category) 'jit-spell)
-                          (buffer-substring-no-properties
-                           (overlay-start ov) (overlay-end ov))))))
-          nil nil nil nil
-          (thing-at-point 'word))
-         'query))
   (pcase-exhaustive where
     ('session (when ispell-buffer-local-name
                 (setq ispell-buffer-local-name (buffer-name)))
               (cl-pushnew word ispell-buffer-session-localwords
                           :test #'equal))
     ('buffer (ispell-add-per-file-word-list word)
-             (jit-spell-accept-word word 'session))
+             (jit-spell--accept-word word 'session))
     ('dict (process-send-string (jit-spell--get-process)
                                 (format "*%s\n#\n" word)))
-    ('query (jit-spell-accept-word
+    ('query (jit-spell--accept-word
              word
              (pcase (read-multiple-choice (substitute-quotes
                                            (format "Add `%s' to" word))
@@ -414,6 +442,7 @@ the above)."
                (`(?b ,_) 'buffer)
                (`(?s ,_) 'session)))))
   (jit-lock-refontify))
+(define-obsolete-function-alias 'jit-spell-accept-word 'jit-spell--accept-word "0.2")
 
 (defun jit-spell-correct-word--next (arg)
   "Perform a spooky action at a distance."
@@ -456,7 +485,7 @@ again moves to the next misspelling."
       ((and count (pred numberp))
        (jit-spell-correct-word count (overlay-start ov)))
       ((and corr (rx bos ?@ (* space) (? (group (+ nonl)))))
-       (jit-spell-accept-word (or (match-string 1 corr) word) 'query))
+       (jit-spell--accept-word (or (match-string 1 corr) word) 'query))
       (corr (jit-spell--apply-correction ov corr)))))
 
 (defalias 'jit-spell-change-dictionary 'ispell-change-dictionary) ;For discoverability
@@ -468,13 +497,7 @@ again moves to the next misspelling."
     (while (search-forward ispell-words-keyword nil t)
       (let ((limit (pos-eol)))
 	(while (re-search-forward "\\s-*\\(\\S-+\\)" limit t)
-          (jit-spell-accept-word (match-string-no-properties 1) 'session))))))
-
-(defun jit-spell--pre-command-hook ()
-  "Pre-command hook for `jit-spell-mode'."
-  (when (and jit-spell--hidden-overlay
-             (not (memq this-command jit-spell-delayed-commands)))
-    (jit-spell--unhide-overlay)))
+          (jit-spell--accept-word (match-string-no-properties 1) 'session))))))
 
 (defvar-keymap jit-spell-mode-map :doc "Keymap for `jit-spell-mode'.")
 
@@ -496,25 +519,30 @@ again moves to the next misspelling."
    (jit-spell-mode
     (cond
      ((derived-mode-p 'prog-mode)
-      (add-function :before-until (local 'jit-spell-ignored-p)
-                    #'jit-spell--prog-ignored-p))
-     ((derived-mode-p 'org-mode)
-      (setq-local jit-spell-delayed-commands
-                  (append '(org-delete-backward-char org-self-insert-command)
-                          jit-spell-delayed-commands))))
+      (add-function :before-until (local 'jit-spell--ignored-p)
+                    #'jit-spell--prog-ignored-p)))
+    (when-let ((pred (or (bound-and-true-p flyspell-generic-check-word-predicate)
+                         (get major-mode 'flyspell-mode-predicate))))
+      (add-function :after-until (local 'jit-spell--ignored-p)
+                    (lambda (_start end) (save-excursion
+                                           (goto-char end)
+                                           (not (funcall pred))))))
+    (when (if (eq 'auto jit-spell-use-apostrophe-hack)
+              ispell-really-hunspell
+            jit-spell-use-apostrophe-hack)
+      (add-function :filter-return (local 'jit-spell--filter-region)
+                    #'jit-spell--apostrophe-hack))
     (jit-spell--read-local-words)
     (add-hook 'ispell-change-dictionary-hook 'jit-spell--unfontify nil t)
     (add-hook 'context-menu-functions 'jit-spell--context-menu nil t)
-    (add-hook 'pre-command-hook #'jit-spell--pre-command-hook nil t)
     (jit-lock-register #'jit-spell--check-region))
    (t
     (jit-lock-unregister #'jit-spell--check-region)
-    (remove-hook 'pre-command-hook #'jit-spell--pre-command-hook)
     (remove-hook 'context-menu-functions 'jit-spell--context-menu t)
     (remove-hook 'ispell-change-dictionary-hook 'jit-spell--unfontify t)
     (kill-local-variable 'ispell-buffer-session-localwords)
-    (kill-local-variable 'jit-spell-delayed-commands)
-    (kill-local-variable 'jit-spell-ignored-p)))
+    (kill-local-variable 'jit-spell--filter-region)
+    (kill-local-variable 'jit-spell--ignored-p)))
   (jit-spell--unfontify))
 
 ;; Don't litter M-x
@@ -523,12 +551,12 @@ again moves to the next misspelling."
   (put sym 'completion-predicate #'ignore))
 
 (dolist (sym '(jit-spell-change-dictionary
-               jit-spell-correct-word
-               jit-spell-accept-word))
+               jit-spell-correct-word))
   (put sym 'completion-predicate (lambda (_ buffer)
                                    (buffer-local-value 'jit-spell-mode
                                                        buffer))))
 
 (provide 'jit-spell)
 
+; LocalWords:  jit ispell
 ;;; jit-spell.el ends here
