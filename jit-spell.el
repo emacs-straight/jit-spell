@@ -118,6 +118,9 @@ move the point with impunity.")
 (defvar-local jit-spell--recheck-timer nil
   "Timer to debounce recheck requests.")
 
+(defvar-local jit-spell--local-words nil
+  "A list of words accepted temporarily in this buffer.")
+
 ;;; Mode-specific support
 
 (defun jit-spell--default-ignored-p (start end)
@@ -129,7 +132,7 @@ move the point with impunity.")
                       face)
           (memq face jit-spell-ignored-faces)))
       (member (buffer-substring-no-properties start end)
-              ispell-buffer-session-localwords)))
+              jit-spell--local-words)))
 
 (defun jit-spell--prog-ignored-p (start _end)
   "Additional ignore predicate for `prog-mode'."
@@ -236,22 +239,24 @@ It can also be bound to a mouse click to pop up the menu."
      (overlay-put ov 'face face)
      (setq jit-spell--hidden-overlay nil))))
 
-(defun jit-spell--unfontify (&optional start end)
-  "Remove overlays and forget checking status from START to END (or whole buffer)."
+(defun jit-spell--unfontify (&optional start end lax)
+  "Remove overlays and forget checking status from START to END (or whole buffer).
+Force refontification of the region, unless LAX is non-nil."
   (save-restriction
     (widen)
     (setq start (or start (point-min)))
     (setq end (or end (point-max)))
     (remove-overlays start end 'category 'jit-spell)
-    (remove-list-of-text-properties start end '(jit-spell-pending))))
+    (remove-list-of-text-properties start end '(jit-spell-pending))
+    (unless lax (jit-lock-refontify start end))))
 
 ;;; Subprocess communication
 
 (defun jit-spell--process-parameters ()
   "Return a list of parameters for this buffer's ispell process."
   (list ispell-program-name
-        ispell-current-dictionary
-        ispell-current-personal-dictionary
+        (or ispell-local-dictionary ispell-dictionary)
+        (or ispell-local-pdict ispell-personal-dictionary)
         ispell-extra-args))
 
 (defun jit-spell--get-process ()
@@ -275,6 +280,7 @@ The process plist includes the following properties:
       (unless ispell-async-processp
         (error "`jit-spell-mode' requires `ispell-async-processp'"))
       (ispell-set-spellchecker-params)
+      (ispell-internal-change-dictionary)
       (setq proc (ispell-start-process))
       (set-process-query-on-exit-flag proc nil)
       (setq jit-spell--process-pool
@@ -425,7 +431,7 @@ the above)."
   (pcase-exhaustive where
     ('session (when ispell-buffer-local-name
                 (setq ispell-buffer-local-name (buffer-name)))
-              (cl-pushnew word ispell-buffer-session-localwords
+              (cl-pushnew word jit-spell--local-words
                           :test #'equal))
     ('buffer (ispell-add-per-file-word-list word)
              (jit-spell--accept-word word 'session))
@@ -524,9 +530,10 @@ again moves to the next misspelling."
     (when-let ((pred (or (bound-and-true-p flyspell-generic-check-word-predicate)
                          (get major-mode 'flyspell-mode-predicate))))
       (add-function :after-until (local 'jit-spell--ignored-p)
-                    (lambda (_start end) (save-excursion
-                                           (goto-char end)
-                                           (not (funcall pred))))))
+                    (lambda (_start end) (ignore-errors
+                                           (save-excursion
+                                             (goto-char end)
+                                             (not (funcall pred)))))))
     (when (if (eq 'auto jit-spell-use-apostrophe-hack)
               ispell-really-hunspell
             jit-spell-use-apostrophe-hack)
@@ -540,10 +547,10 @@ again moves to the next misspelling."
     (jit-lock-unregister #'jit-spell--check-region)
     (remove-hook 'context-menu-functions 'jit-spell--context-menu t)
     (remove-hook 'ispell-change-dictionary-hook 'jit-spell--unfontify t)
-    (kill-local-variable 'ispell-buffer-session-localwords)
+    (kill-local-variable 'jit-spell--local-words)
     (kill-local-variable 'jit-spell--filter-region)
-    (kill-local-variable 'jit-spell--ignored-p)))
-  (jit-spell--unfontify))
+    (kill-local-variable 'jit-spell--ignored-p)
+    (jit-spell--unfontify nil nil t))))
 
 ;; Don't litter M-x
 (dolist (sym '(jit-spell--context-menu
