@@ -6,7 +6,7 @@
 ;; Keywords: tools, wp
 ;; URL: https://github.com/astoff/jit-spell
 ;; Package-Requires: ((emacs "27.1") (compat "29.1"))
-;; Version: 0.1
+;; Version: 0.2
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -42,8 +42,8 @@
 ;;     (define-key jit-spell-mode-map (kbd "C-;") 'jit-spell-correct-word))
 ;;
 ;; jit-spell relies on the `ispell' library to pick a spell checking
-;; program and dictionaries.  Try `M-x customize-group ispell' to see
-;; a listing of all possible settings.
+;; program and dictionaries.  Try `M-x customize-group RET ispell RET'
+;; to see a listing of all possible settings.
 
 ;;; Code:
 
@@ -69,22 +69,35 @@
   :type 'number)
 
 (defcustom jit-spell-ignored-faces
-  '(font-latex-math-face
-    font-latex-sedate-face
-    message-header-name)
+  '(message-header-name)
   "Faces jit-spell should ignore."
+  :type '(repeat face))
+
+(defcustom jit-spell-tex-ignored-faces
+  '(font-latex-math-face
+    font-latex-verbatim-face
+    font-latex-sedate-face
+    font-lock-function-name-face
+    font-lock-keyword-face
+    font-lock-variable-name-face
+    tex-math
+    tex-verbatim)
+  "Faces jit-spell should ignore in TeX and derived modes.
+You can modify this variable buffer locally, say in a mode hook,
+but this must be done before activating `jit-spell-mode.'"
   :type '(repeat face))
 
 (defcustom jit-spell-prog-mode-faces
   '(font-lock-comment-face
     font-lock-doc-face
     font-lock-string-face)
-  "Faces jit-spell should check in modes derived from `prog-mode'."
+  "Faces jit-spell should check in modes derived from `prog-mode'.
+You can modify this variable buffer locally, say in a mode hook,
+but this must done before activating `jit-spell-mode.'"
   :type '(repeat face))
 
 (defcustom jit-spell-use-apostrophe-hack 'auto
   "Whether to work around Hunspell's issue parsing apostrophes.
-
 In some languages, Hunspell always considers the apostrophe
 character (a.k.a. straight quote) part of the word, which leads
 to false positives when it is used as a quotation mark."
@@ -92,14 +105,10 @@ to false positives when it is used as a quotation mark."
                  (const :tag "Yes" t)
                  (const :tag "No" nil)))
 
-(defvar jit-spell-delayed-commands nil)
-(make-obsolete-variable 'jit-spell-delayed-commands "Not necessary anymore" "0.2")
-
 (defvar jit-spell--ignored-p #'jit-spell--default-ignored-p
   "Predicate satisfied by words to ignore.
 It should be a function taking two arguments, the start and end
 positions of the word.")
-(make-obsolete-variable 'jit-spell-ignored-p 'jit-spell--ignored-p "0.2")
 
 (defvar jit-spell--filter-region #'jit-spell--filter-region
   "Function to extract regions of interest from the buffer.
@@ -142,8 +151,6 @@ move the point with impunity.")
                        face)
            (memq face jit-spell-prog-mode-faces)))))
 
-;; TODO: jit-spell--org-ignored-p, etc.
-
 ;;; Overlays
 
 (put 'jit-spell 'evaporate t)
@@ -171,7 +178,7 @@ character offset from START, and a list of corrections."
   (with-current-buffer buffer
     (with-silent-modifications
       (remove-list-of-text-properties start end '(jit-spell-pending))
-      (remove-overlays start end 'category 'jit-spell)
+      (jit-spell--remove-overlays start end)
       (pcase-dolist (`(,word ,offset ,corrections) misspellings)
         (let* ((wstart (+ start offset -1))
                (wend (+ wstart (length word))))
@@ -199,6 +206,19 @@ character offset from START, and a list of corrections."
             (cl-decf i)
             (unless (< 0 i)
               (throw 'jit-spell ov))))))))
+
+(defun jit-spell--remove-overlays (start end &optional gaps)
+  "Remove all `jit-spell' overlays between START and END, skipping GAPS.
+GAPS must be an ordered list of conses, with the intervals closer
+to END coming first."
+  (pcase-dolist (`(,i . ,j) gaps)
+    (dolist (ov (overlays-in j end))
+      (when (eq 'jit-spell (overlay-get ov 'category))
+        (delete-overlay ov)))
+    (setq end i))
+  (dolist (ov (overlays-in start end))
+    (when (eq 'jit-spell (overlay-get ov 'category))
+      (delete-overlay ov))))
 
 (defun jit-spell--apply-correction (ov text)
   "Replace region spanned by OV with TEXT."
@@ -242,11 +262,10 @@ It can also be bound to a mouse click to pop up the menu."
 (defun jit-spell--unfontify (&optional start end lax)
   "Remove overlays and forget checking status from START to END (or whole buffer).
 Force refontification of the region, unless LAX is non-nil."
-  (save-restriction
-    (widen)
+  (without-restriction
     (setq start (or start (point-min)))
     (setq end (or end (point-max)))
-    (remove-overlays start end 'category 'jit-spell)
+    (jit-spell--remove-overlays start end)
     (remove-list-of-text-properties start end '(jit-spell-pending))
     (unless lax (jit-lock-refontify start end))))
 
@@ -330,15 +349,14 @@ The process plist includes the following properties:
                  (jit-spell--make-overlays buffer start end misspellings))))
         (delete-region (point-min) (point-max))
         ;; Send next request to ispell process, if applicable
-        (let (request)
-          (while (and (setq request (pop (process-get proc 'jit-spell--requests)))
-                      (pcase-let ((`(,buffer ,tick) request))
-                        (not (and (buffer-live-p buffer)
-                                  (eq tick (buffer-chars-modified-tick buffer))))))
+        (catch 'jit-spell--done
+          (while-let ((request (pop (process-get proc 'jit-spell--requests)))
+                      (buffer (car request)))
             (when (buffer-live-p buffer)
-              (jit-spell--schedule-pending-checks (car request))))
-          (when request
-            (jit-spell--send-request proc request)))))))
+              (if (not (eq (cadr request) (buffer-chars-modified-tick buffer)))
+                  (jit-spell--schedule-pending-checks buffer)
+                (jit-spell--send-request proc request)
+                (throw 'jit-spell--done nil)))))))))
 
 (defun jit-spell--send-request (proc request)
   "Send REQUEST to ispell process PROC."
@@ -382,6 +400,32 @@ The process plist includes the following properties:
     (while (re-search-forward (rx (+ print)) end t)
       (push (cons (match-beginning 0) (match-end 0)) regions))
     regions))
+
+(defun jit-spell--has-face-p (faces v)
+  "Non-nil if V, a face or list of faces, includes any of the FACES."
+  (if (listp v)
+      (seq-some (lambda (f) (memq f faces)) v)
+    (memq v faces)))
+
+(defun jit-spell--refine-by-face (faces &optional only)
+  "Return a function to refine a list of regions based on its faces.
+If ONLY is nil, regions containing any of the FACES are excluded.
+Otherwise, only such regions are kept."
+  (let ((pred (if only
+                  #'jit-spell--has-face-p
+                (lambda (faces v) (not (jit-spell--has-face-p faces v))))))
+    (lambda (regions)
+      (mapcan
+       (pcase-lambda (`(,i . ,limit)) ;; Refine one region
+         (let (result)
+           (with-restriction i limit
+             (goto-char i)
+             (while-let ((prop (text-property-search-forward 'face faces pred)))
+               (push `(,(prop-match-beginning prop) . ,(prop-match-end prop))
+                     result)))
+           (jit-spell--remove-overlays i limit result)
+           result))
+       regions))))
 
 (defun jit-spell--apostrophe-hack (regions)
   "Refine REGIONS to work around Hunspell's apostrophe issue."
@@ -448,7 +492,6 @@ the above)."
                (`(?b ,_) 'buffer)
                (`(?s ,_) 'session)))))
   (jit-lock-refontify))
-(define-obsolete-function-alias 'jit-spell-accept-word 'jit-spell--accept-word "0.2")
 
 (defun jit-spell-correct-word--next (arg)
   "Perform a spooky action at a distance."
@@ -523,10 +566,15 @@ again moves to the next misspelling."
                                    (mouse-1 . ispell-change-dictionary)))))
   (cond
    (jit-spell-mode
+    ;; Major mode support
     (cond
      ((derived-mode-p 'prog-mode)
-      (add-function :before-until (local 'jit-spell--ignored-p)
-                    #'jit-spell--prog-ignored-p)))
+      (add-function :filter-return (local 'jit-spell--filter-region)
+                    (jit-spell--refine-by-face jit-spell-prog-mode-faces t)))
+     ((derived-mode-p 'tex-mode)
+      (add-function :filter-return (local 'jit-spell--filter-region)
+                    (jit-spell--refine-by-face jit-spell-tex-ignored-faces))))
+    ;; Generic ignore predicate
     (when-let ((pred (or (bound-and-true-p flyspell-generic-check-word-predicate)
                          (get major-mode 'flyspell-mode-predicate))))
       (add-function :after-until (local 'jit-spell--ignored-p)
@@ -534,14 +582,18 @@ again moves to the next misspelling."
                                            (save-excursion
                                              (goto-char end)
                                              (not (funcall pred)))))))
+    ;; Hunspell workaround
     (when (if (eq 'auto jit-spell-use-apostrophe-hack)
               ispell-really-hunspell
             jit-spell-use-apostrophe-hack)
       (add-function :filter-return (local 'jit-spell--filter-region)
                     #'jit-spell--apostrophe-hack))
+    ;; Buffer setup
     (jit-spell--read-local-words)
     (add-hook 'ispell-change-dictionary-hook 'jit-spell--unfontify nil t)
     (add-hook 'context-menu-functions 'jit-spell--context-menu nil t)
+    ;; Font-lock needs to run first
+    (add-hook 'jit-lock-functions #'jit-spell--check-region 10 t)
     (jit-lock-register #'jit-spell--check-region))
    (t
     (jit-lock-unregister #'jit-spell--check-region)
