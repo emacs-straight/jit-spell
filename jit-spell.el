@@ -138,27 +138,6 @@ move the point with impunity.")
 (defvar-local jit-spell--local-words nil
   "A list of words accepted temporarily in this buffer.")
 
-;;; Mode-specific support
-
-(defun jit-spell--default-ignored-p (start end)
-  "Return non-nil if word between START and END should not be spell-checked."
-  (or (get-text-property start 'jit-spell-ignored)
-      (let ((face (get-text-property start 'face)))
-        (if (listp face)
-            (seq-some (lambda (f) (memq f jit-spell-ignored-faces))
-                      face)
-          (memq face jit-spell-ignored-faces)))
-      (member (buffer-substring-no-properties start end)
-              jit-spell--local-words)))
-
-(defun jit-spell--prog-ignored-p (start _end)
-  "Additional ignore predicate for `prog-mode'."
-  (let ((face (get-text-property start 'face)))
-    (not (if (listp face)
-             (seq-some (lambda (f) (memq f jit-spell-prog-mode-faces))
-                       face)
-           (memq face jit-spell-prog-mode-faces)))))
-
 ;;; Overlays
 
 (put 'jit-spell 'evaporate t)
@@ -234,30 +213,6 @@ to END coming first."
     (goto-char (overlay-start ov))
     (delete-region (point) (overlay-end ov))
     (insert-before-markers text)))
-
-(defun jit-spell--context-menu (menu click)
-  "Context menu for `jit-spell-mode'.
-MENU and CLICK are as expected of a member of `context-menu-functions'.
-It can also be bound to a mouse click to pop up the menu."
-  (interactive "i\ne")
-  (save-excursion
-    (mouse-set-point click)
-    (when-let ((ov (jit-spell--overlay-at (point)))
-               (word (buffer-substring-no-properties
-                  (overlay-start ov) (overlay-end ov)))
-               (map (or menu (make-sparse-keymap))))
-      (dolist (corr (overlay-get ov 'jit-spell-corrections))
-        (easy-menu-add-item map '("Correct Word")
-                            (vector corr (lambda () (interactive)
-                                           (jit-spell--apply-correction ov corr)))))
-      (easy-menu-add-item map nil `["Save to Dictionary"
-                                    (jit-spell--accept-word ,word 'dict)])
-      (easy-menu-add-item map nil `["Save to Buffer"
-                                    (jit-spell--accept-word ,word 'buffer)])
-      (easy-menu-add-item map nil `["Accept for Session"
-                                    (jit-spell--accept-word ,word 'session)])
-      (unless menu (popup-menu map)))
-    menu))
 
 (defun jit-spell--unhide-overlay ()
   "Unhide the overlay stored in `jit-spell--hidden-overlay'."
@@ -417,11 +372,21 @@ The process plist includes the following properties:
       (push (cons (match-beginning 0) (match-end 0)) regions))
     regions))
 
+;;; Mode-specific support
+
 (defun jit-spell--has-face-p (faces v)
   "Non-nil if V, a face or list of faces, includes any of the FACES."
   (if (listp v)
       (seq-some (lambda (f) (memq f faces)) v)
     (memq v faces)))
+
+(defun jit-spell--default-ignored-p (start end)
+  "Return non-nil if word between START and END should not be spell-checked."
+  (or (get-text-property start 'jit-spell-ignored)
+      (jit-spell--has-face-p jit-spell-ignored-faces
+                             (get-char-property start 'face))
+      (member (buffer-substring-no-properties start end)
+              jit-spell--local-words)))
 
 (defun jit-spell--refine-by-face (faces &optional only)
   "Return a function to refine a list of regions based on its faces.
@@ -446,18 +411,14 @@ Otherwise, only such regions are kept."
 (defun jit-spell--apostrophe-hack (regions)
   "Refine REGIONS to work around Hunspell's apostrophe issue."
   (mapcan
-   (pcase-lambda (`(,i . ,limit)) ;; Refine one region
+   (pcase-lambda (`(,i . ,end)) ;; Refine one region
      (let (result)
        (goto-char i)
-       (while (re-search-forward
-               (rx (or (seq (or bol (not alpha)) (group ?') alpha)
-                       (seq alpha (group ?') (or (not alpha) eol))))
-               limit t)
-         (backward-char)
-         (let ((j (or (match-end 1) (match-beginning 2))))
-           (push (cons i j) result)
-           (setq i j)))
-       (push (cons i limit) result)))
+       (while (re-search-forward (rx (? (group alpha)) (group (+ ?'))) end t)
+         (unless (and (match-beginning 1) (looking-at-p (rx alpha)))
+           (push (cons i (match-beginning 2)) result)
+           (setq i (point))))
+       (push (cons i end) result)))
    regions))
 
 (defun jit-spell--check-region (start end)
@@ -480,7 +441,7 @@ This is intended to be a member of `jit-lock-functions'."
             (jit-spell--send-request proc request)))))
     `(jit-lock-bounds ,start . ,end)))
 
-;;; Interactive commands and major mode
+;;; Interactive commands
 
 (defun jit-spell--accept-word (word where)
   "Accept spelling of WORD.
@@ -562,6 +523,32 @@ With a numeric ARG, move backwards that many misspellings."
 
 (defalias 'jit-spell-change-dictionary 'ispell-change-dictionary) ;For discoverability
 
+;;; Minor mode definition
+
+(defun jit-spell--context-menu (menu click)
+  "Context menu for `jit-spell-mode'.
+MENU and CLICK are as expected of a member of `context-menu-functions'.
+It can also be bound to a mouse click to pop up the menu."
+  (interactive "i\ne")
+  (save-excursion
+    (mouse-set-point click)
+    (when-let ((ov (jit-spell--overlay-at (point)))
+               (word (buffer-substring-no-properties
+                  (overlay-start ov) (overlay-end ov)))
+               (map (or menu (make-sparse-keymap))))
+      (dolist (corr (overlay-get ov 'jit-spell-corrections))
+        (easy-menu-add-item map '("Correct Word")
+                            (vector corr (lambda () (interactive)
+                                           (jit-spell--apply-correction ov corr)))))
+      (easy-menu-add-item map nil `["Save to Dictionary"
+                                    (jit-spell--accept-word ,word 'dict)])
+      (easy-menu-add-item map nil `["Save to Buffer"
+                                    (jit-spell--accept-word ,word 'buffer)])
+      (easy-menu-add-item map nil `["Accept for Session"
+                                    (jit-spell--accept-word ,word 'session)])
+      (unless menu (popup-menu map)))
+    menu))
+
 (defun jit-spell--read-local-words ()
   "Look for local words in the buffer and accept them for this session."
   (save-excursion
@@ -571,11 +558,10 @@ With a numeric ARG, move backwards that many misspellings."
 	(while (re-search-forward "\\s-*\\(\\S-+\\)" limit t)
           (jit-spell--accept-word (match-string-no-properties 1) 'session))))))
 
-(defvar-keymap jit-spell-mode-map :doc "Keymap for `jit-spell-mode'.")
-
 ;;;###autoload
 (define-minor-mode jit-spell-mode
   "Just-in-time spell checking."
+  :keymap (make-sparse-keymap)
   :lighter (" Spell"
             (:propertize
              (:eval
