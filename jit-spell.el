@@ -50,6 +50,7 @@
 (require 'cl-lib)
 (require 'compat)
 (require 'ispell)
+(require 'text-property-search)
 
 (defgroup jit-spell nil
   "Check spelling as you type."
@@ -141,21 +142,19 @@ move the point with impunity.")
 ;;; Overlays
 
 (put 'jit-spell 'evaporate t)
+(put 'jit-spell 'face 'jit-spell-misspelling)
 
 (defun jit-spell--make-overlay (start end corrections)
   "Make an overlay to highlight incorrect word between START and END.
 Also add the list of CORRECTIONS as a property."
   (let ((ov (make-overlay start end nil t)))
-    (overlay-put ov 'category 'jit-spell)
     (overlay-put ov 'jit-spell-corrections corrections)
     (if (not (<= start (point) end))
-        (overlay-put ov 'face 'jit-spell-misspelling)
+        (overlay-put ov 'category 'jit-spell)
       (jit-spell--unhide-overlay)
       (setq jit-spell--hidden-overlay
-            `(,(run-with-timer jit-spell-current-word-delay nil
-                               #'jit-spell--unhide-overlay)
-              ,ov
-              jit-spell-misspelling)))
+            (cons ov (run-with-timer jit-spell-current-word-delay nil
+                                     #'jit-spell--unhide-overlay))))
     ov))
 
 (defun jit-spell--make-overlays (buffer start end misspellings)
@@ -180,32 +179,31 @@ character offset from START, and a list of corrections."
 
 (defun jit-spell--search-overlay (pos count)
   "Return the COUNT jit-spell overlay from POS."
-  (let* ((limit (if (> count 0) (window-end) (window-start)))
-         (searchfn (if (> count 0)
+  (let* ((limit (if (cl-plusp count) (window-end) (window-start)))
+         (searchfn (if (cl-plusp count)
                        #'next-single-char-property-change
                      #'previous-single-char-property-change))
          (i (abs count)))
     (catch 'jit-spell
       (while (/= pos limit)
         (setq pos (funcall searchfn pos 'category nil limit))
-        (dolist (ov (overlays-at pos))
-          (when (eq (overlay-get ov 'category) 'jit-spell)
-            (cl-decf i)
-            (unless (< 0 i)
-              (throw 'jit-spell ov))))))))
+        (when-let ((ov (jit-spell--overlay-at pos)))
+          (unless (cl-plusp (cl-decf i))
+            (throw 'jit-spell ov)))))))
 
 (defun jit-spell--remove-overlays (start end &optional gaps)
   "Remove all `jit-spell' overlays between START and END, skipping GAPS.
 GAPS must be an ordered list of conses, with the intervals closer
 to END coming first."
-  (pcase-dolist (`(,i . ,j) gaps)
-    (dolist (ov (overlays-in j end))
-      (when (eq 'jit-spell (overlay-get ov 'category))
+  (named-let recur ((i (or (cdar gaps) start))
+                    (j end)
+                    (gaps gaps))
+    (dolist (ov (overlays-in i j))
+      (when (or (eq (overlay-get ov 'category) 'jit-spell)
+                (eq ov (car jit-spell--hidden-overlay)))
         (delete-overlay ov)))
-    (setq end i))
-  (dolist (ov (overlays-in start end))
-    (when (eq 'jit-spell (overlay-get ov 'category))
-      (delete-overlay ov))))
+    (when gaps
+      (recur (or (cdadr gaps) start) (caar gaps) (cdr gaps)))))
 
 (defun jit-spell--apply-correction (ov text)
   "Replace region spanned by OV with TEXT."
@@ -216,17 +214,28 @@ to END coming first."
 
 (defun jit-spell--unhide-overlay ()
   "Unhide the overlay stored in `jit-spell--hidden-overlay'."
-  (pcase jit-spell--hidden-overlay
-    (`(,timer ,ov ,face)
-     (cancel-timer timer)
-     (overlay-put ov 'face face)
-     (setq jit-spell--hidden-overlay nil))))
+  (when jit-spell--hidden-overlay
+    (overlay-put (car jit-spell--hidden-overlay) 'category 'jit-spell)
+    (cancel-timer (cdr jit-spell--hidden-overlay))
+    (setq jit-spell--hidden-overlay nil)))
+
+(defun jit-spell--unhide-overlay-maybe ()
+  "Unhide `jit-spell--hidden-overlay' if it doesn't overlap with word at point."
+  (when-let ((ov (car jit-spell--hidden-overlay)))
+    (unless (and (eq (overlay-buffer ov) (current-buffer))
+                 (save-excursion
+                   (re-search-forward (rx (or blank eol)))
+                   (<= (overlay-start ov) (match-beginning 0)))
+                 (save-excursion
+                   (re-search-backward (rx (or blank bol)))
+                   (<= (match-end 0) (overlay-end ov))))
+      (jit-spell--unhide-overlay))))
 
 (defun jit-spell--unfontify (&optional start end lax)
   "Remove overlays and forget checking status from START to END (or whole buffer).
 Force refontification of the region, unless LAX is non-nil."
   ;; Drop pending requests for this buffer
-  (dolist (proc (seq-filter #'processp jit-spell--process-pool))
+  (pcase-dolist (`(,_ . ,proc) jit-spell--process-pool)
     (setf (process-get proc 'jit-spell--requests)
           (seq-filter (lambda (r) (not (eq (car r) (current-buffer))))
                       (process-get proc 'jit-spell--requests)))
@@ -264,7 +273,7 @@ The process plist includes the following properties:
 `jit-spell--requests': a FIFO queue with elements in the same
   form as above."
   (let* ((params (jit-spell--process-parameters))
-         (proc (plist-get jit-spell--process-pool params #'equal)))
+         (proc (cdr (assoc params jit-spell--process-pool))))
     (if (process-live-p proc)
         proc
       (unless ispell-async-processp
@@ -273,8 +282,7 @@ The process plist includes the following properties:
       (ispell-internal-change-dictionary)
       (setq proc (ispell-start-process))
       (set-process-query-on-exit-flag proc nil)
-      (setq jit-spell--process-pool
-            (plist-put jit-spell--process-pool params proc #'equal))
+      (setf (alist-get params jit-spell--process-pool nil nil #'equal) proc)
       (set-process-filter proc #'jit-spell--process-filter)
       (set-process-buffer proc (generate-new-buffer " *jit-spell*"))
       (process-send-string proc "!\n")  ;Enter terse mode
@@ -368,7 +376,7 @@ The process plist includes the following properties:
   "Return a list of subregions without control characters between START and END."
   (goto-char start)
   (let (regions)
-    (while (re-search-forward (rx (+ print)) end t)
+    (while (re-search-forward (rx (+ (not cntrl))) end t)
       (push (cons (match-beginning 0) (match-end 0)) regions))
     regions))
 
@@ -397,14 +405,14 @@ Otherwise, only such regions are kept."
                 (lambda (faces v) (not (jit-spell--has-face-p faces v))))))
     (lambda (regions)
       (mapcan
-       (pcase-lambda (`(,i . ,limit)) ;; Refine one region
+       (pcase-lambda (`(,start . ,end)) ;; Refine one region
          (let (result)
-           (with-restriction i limit
-             (goto-char i)
+           (with-restriction start end
+             (goto-char start)
              (while-let ((prop (text-property-search-forward 'face faces pred)))
                (push `(,(prop-match-beginning prop) . ,(prop-match-end prop))
                      result)))
-           (jit-spell--remove-overlays i limit result)
+           (jit-spell--remove-overlays start end result)
            result))
        regions))))
 
@@ -426,10 +434,12 @@ Otherwise, only such regions are kept."
 This is intended to be a member of `jit-lock-functions'."
   (save-excursion
     ;; Extend region to include whole words
-    (goto-char start)
-    (setq start (if (re-search-backward "\\s-" nil t) (match-end 0) (point-min)))
-    (goto-char end)
-    (setq end (or (re-search-forward "\\s-" nil t) (point-max)))
+    (setq start (progn (goto-char start)
+                       (re-search-backward (rx (or blank bol)))
+                       (match-end 0)))
+    (setq end (progn (goto-char end)
+                     (re-search-forward (rx (or blank eol)))
+                     (match-beginning 0)))
     (let ((proc (jit-spell--get-process))
           (buffer (current-buffer))
           (tick (buffer-chars-modified-tick)))
@@ -517,7 +527,7 @@ With a numeric ARG, move backwards that many misspellings."
                      (delete-overlay highlight))))
           ((and arg (pred numberp))
            (recur (* (cl-signum count) arg) (overlay-start ov)))
-          ((and corr (rx bos ?@ (* space) (? (group (+ nonl)))))
+          ((and corr (rx bos ?@ (* ?\s) (? (group (+ nonl)))))
            (jit-spell--accept-word (or (match-string 1 corr) word) 'query))
           (corr (jit-spell--apply-correction ov corr)))))))
 
@@ -601,11 +611,13 @@ It can also be bound to a mouse click to pop up the menu."
     (jit-spell--read-local-words)
     (add-hook 'ispell-change-dictionary-hook 'jit-spell--unfontify nil t)
     (add-hook 'context-menu-functions 'jit-spell--context-menu nil t)
+    (add-hook 'post-command-hook #'jit-spell--unhide-overlay-maybe nil t)
     ;; Font-lock needs to run first
     (add-hook 'jit-lock-functions #'jit-spell--check-region 10 t)
     (jit-lock-register #'jit-spell--check-region))
    (t
     (jit-lock-unregister #'jit-spell--check-region)
+    (remove-hook 'post-command-hook #'jit-spell--unhide-overlay-maybe t)
     (remove-hook 'context-menu-functions 'jit-spell--context-menu t)
     (remove-hook 'ispell-change-dictionary-hook 'jit-spell--unfontify t)
     (kill-local-variable 'jit-spell--local-words)
