@@ -6,7 +6,7 @@
 ;; Keywords: tools, wp
 ;; URL: https://github.com/astoff/jit-spell
 ;; Package-Requires: ((emacs "27.1") (compat "29.1"))
-;; Version: 0.2
+;; Version: 0.3
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -291,10 +291,8 @@ The process plist includes the following properties:
 (defun jit-spell--process-filter (proc string)
   "Filter function for jit-spell processes."
   (with-current-buffer (process-buffer proc)
-    (save-excursion
-      (goto-char (point-max))
-      (insert string))
-    (when (re-search-forward "^\n" nil t) ;TODO: Process in chunks
+    (insert string)
+    (when (and (eq (char-before) ?\n) (eq (pos-bol 0) (1- (point))))
       (pcase-let ((`(,buffer ,tick ,start ,end)
                    (process-get proc 'jit-spell--current-request)))
         (process-put proc 'jit-spell--current-request nil)
@@ -575,9 +573,8 @@ It can also be bound to a mouse click to pop up the menu."
   :lighter (" Spell"
             (:propertize
              (:eval
-              (when-let ((s (or ispell-local-dictionary
-			        ispell-dictionary)))
-                (concat "/" (substring s 0 (string-search "_" s)))))))
+              (let ((s (or ispell-local-dictionary ispell-dictionary)))
+                (if s (concat "/" (substring s 0 (string-search "_" s))))))))
   (cond
    (jit-spell-mode
     ;; Major mode support
