@@ -187,9 +187,10 @@ character offset from START, and a list of corrections."
     (catch 'jit-spell
       (while (/= pos limit)
         (setq pos (funcall searchfn pos 'category nil limit))
-        (when-let ((ov (jit-spell--overlay-at pos)))
-          (unless (cl-plusp (cl-decf i))
-            (throw 'jit-spell ov)))))))
+        (unless (invisible-p pos)
+          (when-let ((ov (jit-spell--overlay-at pos)))
+            (unless (cl-plusp (cl-decf i))
+              (throw 'jit-spell ov))))))))
 
 (defun jit-spell--remove-overlays (start end &optional gaps)
   "Remove all `jit-spell' overlays between START and END, skipping GAPS.
@@ -492,7 +493,11 @@ With a numeric ARG, move backwards that many misspellings."
   (interactive "p")
   (if (minibufferp)
       (throw 'jit-spell--next arg)
-    (named-let recur ((count (- arg)) (pos (point)))
+    (named-let recur ((count (- arg))
+                      (pos (if (cl-minusp arg)
+                               (point)
+                             ;; Catch misspelling at point (bug #6)
+                             (min (1+ (point)) (point-max)))))
       (let* ((ov (or (jit-spell--search-overlay pos count)
                      (user-error "No more misspellings")))
              (start (overlay-start ov))
