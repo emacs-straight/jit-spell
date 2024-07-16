@@ -1,0 +1,2 @@
+;; Generated package description from jit-spell.el  -*- no-byte-compile: t -*-
+(define-package "jit-spell" "0.4.0.20240604.141707" "Just-in-time spell checking" '((emacs "27.1") (compat "29.1")) :commit "fcc60d47647d650700575b9fccba04fc086a228c" :authors '(("Augusto Stoffel" . "arstoffel@gmail.com")) :maintainer '("Augusto Stoffel" . "arstoffel@gmail.com") :keywords '("tools" "wp") :url "https://github.com/astoff/jit-spell")
