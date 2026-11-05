@@ -1,2 +1,2 @@
-;; Generated package description from jit-spell.el  -*- no-byte-compile: t -*-
-(define-package "jit-spell" "0.5.0.20251012.84654" "Just-in-time spell checking" '((emacs "27.1") (compat "29.1")) :commit "e6f3525b848c48906f06bf21a9e8678b95ccd3bf" :authors '(("Augusto Stoffel" . "arstoffel@gmail.com")) :maintainer '("Augusto Stoffel" . "arstoffel@gmail.com") :keywords '("tools" "wp") :url "https://github.com/astoff/jit-spell")
+;; Generated package description from jit-spell.el  -*- mode: lisp-data; no-byte-compile: t; lexical-binding:t -*-
+(define-package "jit-spell" "0.5.0.20261104.7" "Just-in-time spell checking" '((emacs "28.1") (compat "31.1")) :commit "6fb5d63860d1714b39c8581e6ee860ed7abd86bf" :authors '(("Augusto Stoffel" . "arstoffel@gmail.com")) :maintainer '("Augusto Stoffel" . "arstoffel@gmail.com") :keywords '("text") :url "https://github.com/astoff/jit-spell")
