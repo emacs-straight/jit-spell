@@ -6,7 +6,7 @@
 ;; Keywords: text
 ;; URL: https://github.com/astoff/jit-spell
 ;; Package-Requires: ((emacs "28.1") (compat "31.1"))
-;; Version: 0.5
+;; Version: 0.6
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -44,6 +44,13 @@
 ;; jit-spell relies on the `ispell' library to pick a spell checking
 ;; program and dictionaries.  Try `M-x customize-group RET ispell RET'
 ;; to see a listing of all possible settings.
+
+;;; News:
+
+;; Version 0.6
+;; - Add `jit-spell-dictionary' variable and rename the
+;;  `jit-spell-change-dictionary' to `jit-spell-dictionary'.
+;; - Define `jit-spell-engine' and add support for vibe-spell.
 
 ;;; Code:
 
@@ -167,14 +174,14 @@ hide the overlay while editing the word."
 
 (defun jit-spell--overlay-at (pos)
   "Return the jit-spell overlay at POS, if it exists."
-  (seq-some (lambda (ov)
-              (and (eq (overlay-get ov 'category) 'jit-spell) ov))
-            (overlays-at pos)))
+  (car (any (lambda (ov)
+              (eq (overlay-get ov 'category) 'jit-spell))
+            (overlays-at pos))))
 
 (defun jit-spell--search-overlay (pos count)
   "Return the COUNT jit-spell overlay from POS."
-  (let* ((limit (if (cl-plusp count) (window-end) (window-start)))
-         (searchfn (if (cl-plusp count)
+  (let* ((limit (if (plusp count) (window-end) (window-start)))
+         (searchfn (if (plusp count)
                        #'next-single-char-property-change
                      #'previous-single-char-property-change))
          (i (abs count)))
@@ -183,7 +190,7 @@ hide the overlay while editing the word."
         (setq pos (funcall searchfn pos 'category nil limit))
         (unless (invisible-p pos)
           (when-let* ((ov (jit-spell--overlay-at pos)))
-            (unless (cl-plusp (cl-decf i))
+            (unless (plusp (decf i))
               (throw 'jit-spell ov))))))))
 
 (defun jit-spell--remove-overlays (start end &optional gaps)
@@ -368,9 +375,9 @@ REQUEST a list once passed to jit-spell--schedule`."
                         (wend (match-end 0))
                         (word (match-string 0)))
                     (unless (or (funcall jit-spell--ignored-p wstart)
-                                (seq-some (lambda (dict)
-                                            (vibe-spell-check dict word))
-                                          dicts))
+                                (any (lambda (dict)
+                                       (vibe-spell-check dict word))
+                                     dicts))
                       (jit-spell--make-overlay wstart wend opoint))))))))))))
 
 (cl-defmethod jit-spell--schedule
@@ -628,7 +635,7 @@ Otherwise, only such regions are kept."
 (defun jit-spell--has-face-p (faces v)
   "Non-nil if V, a face or list of faces, includes any of the FACES."
   (if (listp v)
-      (seq-some (lambda (f) (memq f faces)) v)
+      (member-if (lambda (f) (memq f faces)) v)
     (memq v faces)))
 
 (defun jit-spell--default-ignored-p (start)
@@ -691,7 +698,7 @@ With a numeric ARG, move backwards that many misspellings."
   (if (minibufferp)
       (throw 'jit-spell--next arg)
     (named-let recur ((count (- arg))
-                      (pos (if (cl-minusp arg)
+                      (pos (if (minusp arg)
                                (point)
                              ;; Catch misspelling at point (bug #6)
                              (min (1+ (point)) (point-max)))))

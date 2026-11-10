@@ -1,0 +1,4 @@
+Version 0.6
+- Add `jit-spell-dictionary' variable and rename the
+ `jit-spell-change-dictionary' to `jit-spell-dictionary'.
+- Define `jit-spell-engine' and add support for vibe-spell.
